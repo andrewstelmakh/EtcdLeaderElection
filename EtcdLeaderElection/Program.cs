@@ -4,7 +4,6 @@ using System.Threading.Tasks;
 using dotnet_etcd;
 using Etcdserverpb;
 using Google.Protobuf;
-using Grpc.Core;
 using Mvccpb;
 
 namespace EtcdLeaderElection
@@ -14,96 +13,82 @@ namespace EtcdLeaderElection
         private const long Ttl = 5;
         private const string LeaderKey = "/leader";
         private static readonly EtcdClient EtcdClient = new EtcdClient("http://localhost:2379");
-        private static long Lease;
         
         static async Task Main(string[] args)
         {
             var serverName = args[0];
-
+                
             while (true)
             {
                 var leaderResult = await ElectLeader(serverName);
                 if (leaderResult.Item1)
                 {
-                    Console.WriteLine("I am the leader.");
-                    Console.CancelKeyPress += ConsoleOnCancelKeyPress;
+                    Console.WriteLine("I am a leader.");
                     await LeadershipGained(leaderResult.Item2);
+                    break;
                 }
-                else
-                {
-                    Console.WriteLine("I am a follower.");
-                    await WitForNextElection();
-                }
+                
+                Console.WriteLine("I am a follower.");
+                await WaitForNextElection();
             }
         }
 
-        private static void ConsoleOnCancelKeyPress(object sender, ConsoleCancelEventArgs e)
+        private static async Task WaitForNextElection()
         {
-            Console.WriteLine("Revoking leader lease");
-
-            EtcdClient.LeaseRevokeAsync(new LeaseRevokeRequest()
-            {
-                ID = Lease
-            });
-            
-            Environment.Exit(-1);
-        }
-
-        private static async Task WitForNextElection()
-        {
+            var watchId = 100500;
             var request = new WatchRequest()
             {
                 CreateRequest = new WatchCreateRequest()
                 {
-                    Key = ByteString.CopyFromUtf8(LeaderKey)
-                },
+                    Key = ByteString.CopyFromUtf8(LeaderKey),
+                    WatchId = watchId
+                }
             };
 
-            Console.WriteLine("Waiting for leader to die.");
+            var canObtainLeadership = false;
             
-            var cancellationTokeSource = new CancellationTokenSource();
-            
-            try
+            EtcdClient.Watch(request, async response =>
             {
-                await EtcdClient.Watch(request, async response =>
+                foreach (var @event in response.Events)
                 {
-                    foreach (var @event in response.Events)
+                    if (@event.Type == Event.Types.EventType.Delete)
                     {
-                        if (@event.Type == Event.Types.EventType.Delete)
-                        {
-                            Console.WriteLine("Leader died. Cancelling watch.");
-                            cancellationTokeSource.Cancel();
-                        }
+                        Console.WriteLine("Leader died. Election needed.");
+                        canObtainLeadership = true;
                     }
-                }, cancellationToken: cancellationTokeSource.Token);
-            }
-            catch (RpcException)
+                }
+            });
+
+            while (!canObtainLeadership)
             {
-                Console.WriteLine("Watch cancelled");
+                Console.WriteLine("Waiting for leader to die.");
+                await DoWork();
             }
         }
+        
         private static async Task LeadershipGained(long lease)
         {
-            while (true)
-            {
-                try
-                {
-                    Console.WriteLine("Refreshing. Still a leader.");
-                    await EtcdClient.LeaseKeepAlive(new LeaseKeepAliveRequest()
-                    {
-                        ID = lease
-                    }, response =>
-                    {
+            Console.WriteLine("Press ESC to terminate");
 
-                    }, CancellationToken.None);
-                    await DoWork();
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Revoking lease. No longer a leader.");
-                    await EtcdClient.LeaseRevokeAsync(new LeaseRevokeRequest() {ID = lease});
-                }
+            while (!(Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Escape))
+            {
+                Console.WriteLine("Refreshing. Still a leader.");
+                EtcdClient.LeaseKeepAlive(lease, CancellationToken.None);
+                
+                await DoWork();
             }
+
+            await Revoke(lease);
+        }
+
+        private static async Task Revoke(long lease)
+        {
+            Console.WriteLine("Revoking leader lease. Terminating.");
+            
+            await EtcdClient.LeaseRevokeAsync(new LeaseRevokeRequest
+            {
+                ID = lease
+            });
         }
 
         private static Task DoWork()
@@ -120,9 +105,7 @@ namespace EtcdLeaderElection
                 TTL = Ttl
             });
 
-            Lease = leaseResponse.ID;
-
-            var put = await TryPut(LeaderKey, serverName, Lease);
+            var put = await TryPut(LeaderKey, serverName, leaseResponse.ID);
             return (put, leaseResponse.ID);
         }
 
